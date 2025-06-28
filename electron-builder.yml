@@ -11,6 +11,11 @@ files:
   - '!{tsconfig.json,tsconfig.node.json,tsconfig.web.json}'
 asarUnpack:
   - resources/**
+  - '**/*.onnx'
+  - '**/*.node'
+  - '**/sharp/**/*'
+  - '**/better-sqlite3/**/*'
+  - '**/hnswlib-node/**/*'
 win:
   executableName: electron-ocr-baml
 nsis:

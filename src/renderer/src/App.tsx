@@ -1,119 +1,332 @@
-import { useState } from 'react'
-import log from 'electron-log/renderer'
+import { useState, useEffect, useCallback } from 'react'
+import { 
+  Search, 
+  Camera, 
+  Heart, 
+  Clock, 
+  Folder, 
+  Tag, 
+  Settings, 
+  Grid, 
+  List,
+  Filter,
+  Plus,
+  X
+} from 'lucide-react'
 
-// Define the expected type for the extracted text response
-interface ExtractedText {
-  quote: string
-  author: string
+// Components
+import Sidebar from './components/Sidebar'
+import ScreenshotGrid from './components/ScreenshotGrid'
+import SearchBar from './components/SearchBar'
+import Toolbar from './components/Toolbar'
+import ScreenshotEditor from './components/ScreenshotEditor'
+import KeyboardShortcutsModal from './components/KeyboardShortcutsModal'
+
+// Hooks
+import useKeyboardShortcuts, { shortcuts } from './hooks/useKeyboardShortcuts'
+
+// Types
+interface Screenshot {
+  id: string
+  filepath: string
+  thumbnail_path?: string
+  filename: string
+  created_at: number
+  file_size: number
+  width?: number
+  height?: number
+  is_favorite: boolean
 }
 
-function App(): React.JSX.Element {
-  const [extractedText, setExtractedText] = useState<string | null>(null)
-  const [isLoading, setIsLoading] = useState<boolean>(false)
-  const [error, setError] = useState<string | null>(null)
-  const [screenshotData, setScreenshotData] = useState<string | null>(null)
+interface AppState {
+  screenshots: Screenshot[]
+  selectedScreenshots: Set<string>
+  currentView: 'grid' | 'list'
+  searchQuery: string
+  selectedFolder: string | null
+  selectedTags: number[]
+  isLoading: boolean
+  error: string | null
+  editingScreenshot: Screenshot | null
+}
 
-  const handleScreenshot = async (): Promise<void> => {
-    setIsLoading(true)
-    setError(null)
-    log.info('Starting screenshot process in renderer')
-    try {
-      // Request screenshot from main process
-      log.info('Requesting screenshot from main process')
-      const screenshot = await window.api.requestScreenshot()
-      if (screenshot) {
-        log.info('Screenshot received, updating UI')
-        setScreenshotData(screenshot)
-        // Request text extraction from main process via IPC
-        try {
-          log.info('Requesting text extraction from screenshot')
-          const result = await window.api.extractTextFromImage(screenshot)
-          log.info('Text extraction completed, updating UI')
-          // Check if result matches the expected type
-          if (result && typeof result === 'object' && 'quote' in result && 'author' in result) {
-            const extracted = result as ExtractedText
-            setExtractedText(`${extracted.quote} - ${extracted.author}`)
-          } else {
-            setExtractedText(JSON.stringify(result))
-          }
-        } catch (bamlError) {
-          log.error(`Text extraction error: ${(bamlError as Error).message || String(bamlError)}`)
-          setError(`Text extraction error: ${(bamlError as Error).message || String(bamlError)}`)
-        }
-      } else {
-        log.error('Failed to capture screenshot')
-        setError('Failed to capture screenshot')
+function App() {
+  console.log('App component is rendering')
+  
+  const [showShortcutsModal, setShowShortcutsModal] = useState(false)
+  const [state, setState] = useState<AppState>({
+    screenshots: [],
+    selectedScreenshots: new Set(),
+    currentView: 'grid',
+    searchQuery: '',
+    selectedFolder: null,
+    selectedTags: [],
+    isLoading: false,
+    error: null,
+    editingScreenshot: null
+  })
+
+  // Keyboard shortcuts setup
+  const keyboardShortcuts = [
+    shortcuts.captureScreen(() => handleScreenshot()),
+    shortcuts.search(() => document.querySelector<HTMLInputElement>('input[type="search"]')?.focus()),
+    shortcuts.refresh(() => loadScreenshots()),
+    shortcuts.toggleGrid(() => setState(prev => ({ ...prev, currentView: 'grid' }))),
+    shortcuts.toggleList(() => setState(prev => ({ ...prev, currentView: 'list' }))),
+    shortcuts.selectAll(() => {
+      const allIds = new Set(state.screenshots.map(s => s.id))
+      setState(prev => ({ ...prev, selectedScreenshots: allIds }))
+    }),
+    shortcuts.deselectAll(() => setState(prev => ({ ...prev, selectedScreenshots: new Set() }))),
+    shortcuts.deleteSelected(() => {
+      if (state.selectedScreenshots.size > 0) {
+        Array.from(state.selectedScreenshots).forEach(id => handleDeleteScreenshot(id))
       }
-    } catch (err: unknown) {
-      log.error(`Error capturing screenshot: ${(err as Error).message || String(err)}`)
-      setError(`Error capturing screenshot: ${(err as Error).message || String(err)}`)
-    } finally {
-      log.info('Screenshot process completed, updating loading state')
-      setIsLoading(false)
+    }),
+    shortcuts.favoriteSelected(() => {
+      if (state.selectedScreenshots.size > 0) {
+        Array.from(state.selectedScreenshots).forEach(id => handleToggleFavorite(id))
+      }
+    }),
+    shortcuts.exportSelected(() => {
+      if (state.selectedScreenshots.size > 0) {
+        // TODO: Implement bulk export
+        console.log('Export selected screenshots:', Array.from(state.selectedScreenshots))
+      }
+    }),
+    shortcuts.openEditor(() => {
+      if (state.selectedScreenshots.size === 1) {
+        const screenshot = state.screenshots.find(s => s.id === Array.from(state.selectedScreenshots)[0])
+        if (screenshot) handleEditScreenshot(screenshot)
+      }
+    }),
+    shortcuts.closeEditor(() => {
+      if (state.editingScreenshot) handleCloseEditor()
+    }),
+    shortcuts.showShortcuts(() => setShowShortcutsModal(true)),
+  ]
+
+  useKeyboardShortcuts({ 
+    shortcuts: keyboardShortcuts, 
+    enabled: !state.editingScreenshot && !showShortcutsModal 
+  })
+
+  // Load screenshots on component mount
+  useEffect(() => {
+    loadScreenshots()
+    
+    // Set up event listeners
+    window.api.onScreenshotProcessed((data) => {
+      console.log('Screenshot processed:', data)
+      loadScreenshots() // Refresh the list
+    })
+
+    window.api.onFocusSearch(() => {
+      const searchInput = document.querySelector('input[type="search"]') as HTMLInputElement
+      if (searchInput) {
+        searchInput.focus()
+      }
+    })
+
+    return () => {
+      window.api.removeAllListeners('screenshot-processed')
+      window.api.removeAllListeners('focus-search')
     }
-  }
+  }, [])
 
+  const loadScreenshots = useCallback(async () => {
+    try {
+      setState(prev => ({ ...prev, isLoading: true, error: null }))
+      
+      let screenshots: Screenshot[]
+      
+      if (state.searchQuery) {
+        const results = await window.api.searchScreenshots(state.searchQuery)
+        screenshots = results.map(result => result.screenshot)
+      } else if (state.selectedFolder) {
+        screenshots = await window.api.getScreenshotsForFolder(parseInt(state.selectedFolder))
+      } else {
+        screenshots = await window.api.getAllScreenshots(0, 100)
+      }
+      
+      setState(prev => ({ 
+        ...prev, 
+        screenshots, 
+        isLoading: false 
+      }))
+    } catch (error) {
+      console.error('Failed to load screenshots:', error)
+      setState(prev => ({ 
+        ...prev, 
+        error: 'Failed to load screenshots', 
+        isLoading: false 
+      }))
+    }
+  }, [state.searchQuery, state.selectedFolder])
+
+  // Reload when search query or folder changes
+  useEffect(() => {
+    const timeoutId = setTimeout(() => {
+      loadScreenshots()
+    }, 300) // Debounce search
+
+    return () => clearTimeout(timeoutId)
+  }, [state.searchQuery, state.selectedFolder, loadScreenshots])
+
+  const handleSearch = useCallback((query: string) => {
+    setState(prev => ({ ...prev, searchQuery: query }))
+  }, [])
+
+  const handleScreenshot = useCallback(async () => {
+    try {
+      setState(prev => ({ ...prev, isLoading: true, error: null }))
+      
+      const screenshot = await window.api.captureScreenshot()
+      if (screenshot) {
+        // Refresh the screenshots list
+        setTimeout(() => {
+          loadScreenshots()
+        }, 1000) // Give time for AI processing
+      }
+    } catch (error) {
+      console.error('Screenshot failed:', error)
+      setState(prev => ({ 
+        ...prev, 
+        error: 'Failed to capture screenshot', 
+        isLoading: false 
+      }))
+    } finally {
+      setState(prev => ({ ...prev, isLoading: false }))
+    }
+  }, [loadScreenshots])
+
+  const handleToggleFavorite = useCallback(async (screenshotId: string) => {
+    try {
+      await window.api.toggleFavorite(screenshotId)
+      loadScreenshots()
+    } catch (error) {
+      console.error('Failed to toggle favorite:', error)
+    }
+  }, [loadScreenshots])
+
+  const handleDeleteScreenshot = useCallback(async (screenshotId: string) => {
+    try {
+      await window.api.deleteScreenshot(screenshotId)
+      loadScreenshots()
+    } catch (error) {
+      console.error('Failed to delete screenshot:', error)
+    }
+  }, [loadScreenshots])
+
+  const handleSelectionChange = useCallback((selectedIds: Set<string>) => {
+    setState(prev => ({ ...prev, selectedScreenshots: selectedIds }))
+  }, [])
+
+  const handleViewChange = useCallback((view: 'grid' | 'list') => {
+    setState(prev => ({ ...prev, currentView: view }))
+  }, [])
+
+  const handleEditScreenshot = useCallback((screenshot: Screenshot) => {
+    setState(prev => ({ ...prev, editingScreenshot: screenshot }))
+  }, [])
+
+  const handleCloseEditor = useCallback(() => {
+    setState(prev => ({ ...prev, editingScreenshot: null }))
+  }, [])
+
+  const handleSaveEditedScreenshot = useCallback(async (editedImageData: string) => {
+    // TODO: Implement saving edited screenshot
+    console.log('Saving edited screenshot:', editedImageData)
+    handleCloseEditor()
+  }, [handleCloseEditor])
+
+  console.log('App component about to return JSX', { state })
+  
   return (
-    <div className="flex flex-col min-h-screen bg-gradient-to-br from-gray-900 via-gray-800 to-indigo-900 text-gray-100 font-sans antialiased">
-      {/* Header */}
-      <header className="p-3 border-b border-gray-700 shadow-sm">
-        <h1 className="text-indigo-400 text-3xl font-extrabold tracking-wide text-center">
-          Electron OCR with BAML
-        </h1>
-        <p className="text-gray-400 text-sm mt-1 text-center">
-          Capture screenshots and extract text effortlessly.
-        </p>
-      </header>
+    <div className="flex h-screen text-gray-900 dark:text-white bg-transparent rounded-xl overflow-hidden">
+      {/* Native macOS Sidebar */}
+      <div className="w-64 macos-vibrancy-sidebar">
+        <Sidebar 
+          onFolderSelect={(folderId) => setState(prev => ({ ...prev, selectedFolder: folderId }))}
+          onTagSelect={(tagIds) => setState(prev => ({ ...prev, selectedTags: tagIds }))}
+          selectedFolder={state.selectedFolder}
+          selectedTags={state.selectedTags}
+        />
+      </div>
 
-      {/* Main Content */}
-      <main className="flex-1 flex flex-col items-center p-3 overflow-y-auto">
-        <button
-          onClick={handleScreenshot}
-          disabled={isLoading}
-          className={`px-6 py-3 text-xl font-semibold bg-indigo-500 text-white border-none rounded-lg shadow-md ${isLoading ? 'cursor-not-allowed opacity-60' : 'cursor-pointer hover:bg-indigo-600 hover:shadow-lg'} transition-all duration-300 mb-6`}
-        >
-          {isLoading ? 'Capturing...' : 'Take Screenshot & Extract Text'}
-        </button>
+      {/* Main Content Area */}
+      <div className="flex-1 flex flex-col macos-vibrancy-content">
+        {/* Header with Search and Toolbar */}
+        <header className="h-16 macos-vibrancy-toolbar flex items-center px-6 gap-4">
+          <SearchBar 
+            value={state.searchQuery}
+            onChange={handleSearch}
+            placeholder="Search screenshots..."
+            className="flex-1"
+          />
+          
+          <Toolbar
+            currentView={state.currentView}
+            onViewChange={handleViewChange}
+            onCapture={handleScreenshot}
+            isCapturing={state.isLoading}
+            selectedCount={state.selectedScreenshots.size}
+          />
+        </header>
 
-        {error && (
-          <div className="w-full max-w-3xl mb-6 pt-4">
-            <p className="text-red-400 text-base font-medium bg-red-900 bg-opacity-30 px-4 py-2 rounded-lg text-center">
-              {error}
-            </p>
+        {/* Error Display */}
+        {state.error && (
+          <div className="mx-6 mt-4 p-3 bg-red-100 dark:bg-red-900/30 border border-red-300 dark:border-red-700 rounded-lg">
+            <div className="flex items-center justify-between">
+              <p className="text-red-800 dark:text-red-200 text-sm">{state.error}</p>
+              <button
+                onClick={() => setState(prev => ({ ...prev, error: null }))}
+                className="text-red-600 dark:text-red-400 hover:text-red-800 dark:hover:text-red-200"
+              >
+                <X size={16} />
+              </button>
+            </div>
           </div>
         )}
 
-        <div className="w-full max-w-3xl flex flex-col gap-3 pt-4">
-          {screenshotData && (
-            <div className="w-full h-[400px] overflow-hidden border border-gray-700 rounded-2xl bg-gray-800 bg-opacity-80 shadow-lg">
-              <h3 className="text-indigo-400 text-xl text-center font-black mb-3 p-3 pb-0">
-                Screenshot Preview:
-              </h3>
-              <div className="w-full h-[340px] overflow-auto p-3 pt-0">
-                <img
-                  src={screenshotData}
-                  alt="Screenshot Preview"
-                  className="w-full h-auto block object-contain rounded-xl shadow-sm border border-gray-700 max-h-[320px]"
-                />
-              </div>
-            </div>
-          )}
+        {/* Main Content */}
+        <main className="flex-1 overflow-hidden bg-transparent">
+          <ScreenshotGrid
+            screenshots={state.screenshots}
+            selectedScreenshots={state.selectedScreenshots}
+            viewMode={state.currentView}
+            isLoading={state.isLoading}
+            onSelectionChange={handleSelectionChange}
+            onToggleFavorite={handleToggleFavorite}
+            onDelete={handleDeleteScreenshot}
+            onEdit={handleEditScreenshot}
+          />
+        </main>
 
-          {extractedText && (
-            <div className="max-h-[300px] overflow-y-auto w-full bg-gray-800 bg-opacity-80 p-3 rounded-2xl text-gray-200 border border-gray-700 shadow-lg">
-              <h3 className="text-indigo-400 text-xl font-bold mb-2">Extracted Text:</h3>
-              <p className="whitespace-pre-wrap leading-relaxed text-base text-gray-300">
-                {extractedText}
-              </p>
-            </div>
+        {/* Status Bar */}
+        <div className="h-8 bg-gray-100/80 dark:bg-gray-900/80 backdrop-blur-2xl border-t border-white/20 flex items-center px-6 text-xs text-gray-600 dark:text-gray-300">
+          <span>{state.screenshots.length} screenshot{state.screenshots.length !== 1 ? 's' : ''}</span>
+          {state.selectedScreenshots.size > 0 && (
+            <span className="ml-4">{state.selectedScreenshots.size} selected</span>
           )}
         </div>
-      </main>
+      </div>
 
-      {/* Footer */}
-      <footer className="p-2 text-center text-gray-500 text-sm border-t border-gray-700">
-        Powered by Electron & BAML
-      </footer>
+      {/* Screenshot Editor Modal */}
+      {state.editingScreenshot && (
+        <ScreenshotEditor
+          screenshot={state.editingScreenshot}
+          onClose={handleCloseEditor}
+          onSave={handleSaveEditedScreenshot}
+        />
+      )}
+
+      {/* Keyboard Shortcuts Help Modal */}
+      <KeyboardShortcutsModal
+        isOpen={showShortcutsModal}
+        onClose={() => setShowShortcutsModal(false)}
+        shortcuts={keyboardShortcuts}
+      />
     </div>
   )
 }
